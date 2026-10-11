@@ -1,6 +1,8 @@
 import sqlite3
 import uuid
 import json
+import os
+import requests
 from datetime import datetime, date
 from pathlib import Path
 
@@ -13,6 +15,8 @@ import streamlit as st
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "orders.db"
+DEFAULT_MODEL = "openai/gpt-4o-mini"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 st.set_page_config(
     page_title="Bếp Nhà - Tính hóa đơn",
@@ -190,7 +194,8 @@ page = st.sidebar.radio(
     [
         "🧾 Tạo hóa đơn",
         "🍽️ Quản lý món ăn",
-        "📊 Lịch sử & thống kê"
+        "📊 Lịch sử & thống kê",
+        "🤖 Chatbot AI"
     ]
 )
 
@@ -789,7 +794,7 @@ elif page == "🍽️ Quản lý món ăn":
 # 8. LỊCH SỬ VÀ THỐNG KÊ
 # ==================================================
 
-else:
+elif page == "📊 Lịch sử & thống kê":
 
     st.subheader("📊 Lịch sử & thống kê")
 
@@ -1017,8 +1022,166 @@ else:
             )
 
 
+# ==================================================
+# 9. CHATBOT AI QUA OPENROUTER
+# ==================================================
+
+else:
+    st.subheader("🤖 Chatbot AI - Bếp Nhà")
+    st.caption(
+        "Hỏi về cách sử dụng ứng dụng, thực đơn hoặc số liệu kinh doanh. "
+        "Chatbot chỉ tư vấn; nó không tự sửa món ăn hay tạo hóa đơn."
+    )
+
+    def get_openrouter_api_key():
+        """Đọc khóa từ Streamlit secrets hoặc biến môi trường."""
+        try:
+            secret_key = st.secrets.get("OPENROUTER_API_KEY", "")
+        except Exception:
+            secret_key = ""
+        return secret_key or os.getenv("OPENROUTER_API_KEY", "")
+
+    def build_business_context():
+        """Tạo ngữ cảnh gọn từ thực đơn và hóa đơn đã lưu."""
+        menu = get_menu(active_only=True)
+        orders = get_orders()
+
+        menu_lines = []
+        if not menu.empty:
+            for _, item in menu.head(80).iterrows():
+                menu_lines.append(
+                    f"- {item['name']} | {item['category']} | {int(item['price']):,} VND"
+                )
+
+        order_summary = "Chưa có hóa đơn được lưu."
+        if not orders.empty:
+            orders = orders.copy()
+            orders["total"] = pd.to_numeric(orders["total"], errors="coerce").fillna(0)
+            order_summary = (
+                f"Số hóa đơn đã lưu: {len(orders)}. "
+                f"Tổng doanh thu trên các hóa đơn đã lưu: {int(orders['total'].sum()):,} VND."
+            )
+            try:
+                parsed = []
+                for _, order in orders.head(30).iterrows():
+                    created = str(order.get("created_at", ""))[:10]
+                    parsed.append((created, int(order.get("total", 0))))
+                if parsed:
+                    order_summary += " Các hóa đơn gần đây (ngày, tổng tiền): " + "; ".join(
+                        f"{day}: {amount:,} VND" for day, amount in parsed
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        menu_text = "\n".join(menu_lines) if menu_lines else "Thực đơn hiện chưa có món đang bán."
+        return f"THỰC ĐƠN ĐANG BÁN:\n{menu_text}\n\nTÓM TẮT HÓA ĐƠN:\n{order_summary}"
+
+    def ask_openrouter(messages):
+        api_key = get_openrouter_api_key()
+        if not api_key:
+            raise RuntimeError(
+                "Chưa cấu hình API key. Hãy đặt OPENROUTER_API_KEY trong file .env "
+                "(được nạp vào môi trường) hoặc trong .streamlit/secrets.toml."
+            )
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:8501",
+            "X-Title": "Bep Nha Chatbot",
+        }
+        payload = {
+            "model": DEFAULT_MODEL,
+            "messages": messages,
+            "temperature": 0.5,
+            "max_tokens": 900,
+        }
+        try:
+            response = requests.post(
+                OPENROUTER_URL,
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+        except requests.Timeout as exc:
+            raise RuntimeError("Yêu cầu chatbot quá thời gian chờ. Hãy thử lại.") from exc
+        except requests.HTTPError as exc:
+            detail = ""
+            try:
+                detail = response.json().get("error", {}).get("message", "")
+            except Exception:
+                pass
+            if response.status_code in (401, 403):
+                message = "API key không hợp lệ hoặc chưa được cấp quyền."
+            elif response.status_code == 429:
+                message = "Bạn đã chạm giới hạn tốc độ hoặc số dư API."
+            else:
+                message = f"OpenRouter trả về lỗi HTTP {response.status_code}."
+            if detail:
+                message += f" Chi tiết: {detail}"
+            raise RuntimeError(message) from exc
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError("Phản hồi từ chatbot không đúng định dạng mong đợi.") from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Không kết nối được OpenRouter: {exc}") from exc
+
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    with st.expander("Cấu hình chatbot", expanded=False):
+        st.write(f"**Model:** `{DEFAULT_MODEL}`")
+        st.write("API key được đọc từ `OPENROUTER_API_KEY`; không ghi khóa trực tiếp vào mã nguồn.")
+        if get_openrouter_api_key():
+            st.success("Đã tìm thấy cấu hình API key.")
+        else:
+            st.warning("Chưa tìm thấy API key trong secrets hoặc biến môi trường.")
+
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    prompt = st.chat_input("Nhập câu hỏi cho Bếp Nhà...")
+    if prompt:
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        system_prompt = (
+            "Bạn là trợ lý AI cho ứng dụng quản lý quán ăn Bếp Nhà. "
+            "Trả lời bằng tiếng Việt, rõ ràng và thực tế. Hỗ trợ giải thích cách dùng ứng dụng, "
+            "thực đơn, giá bán và phân tích số liệu được cung cấp. Chỉ dựa vào dữ liệu trong ngữ cảnh "
+            "khi nói về hoạt động kinh doanh; nếu thiếu dữ liệu thì nói rõ. Không khẳng định đã tạo, "
+            "xóa hoặc sửa hóa đơn/món ăn vì bạn không có quyền thực hiện các thao tác đó. "
+            "Không yêu cầu người dùng gửi API key hoặc thông tin bí mật.\n\n"
+            + build_business_context()
+        )
+        history = [{"role": "system", "content": system_prompt}]
+        # Giới hạn lịch sử gửi lên API để tránh yêu cầu quá dài.
+        history.extend(st.session_state.chat_messages[-16:])
+
+        with st.chat_message("assistant"):
+            with st.spinner("Bếp Nhà AI đang suy nghĩ..."):
+                try:
+                    answer = ask_openrouter(history)
+                    st.markdown(answer)
+                    st.session_state.chat_messages.append(
+                        {"role": "assistant", "content": answer}
+                    )
+                except RuntimeError as error:
+                    st.error(str(error))
+
+    col_chat1, col_chat2 = st.columns([1, 4])
+    with col_chat1:
+        if st.button("🧹 Xóa lịch sử chat", use_container_width=True):
+            st.session_state.chat_messages = []
+            st.rerun()
+
+
 # =========================
-# 9. CHÂN TRANG
+# 10. CHÂN TRANG
 # =========================
 
 st.divider()
